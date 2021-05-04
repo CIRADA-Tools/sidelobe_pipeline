@@ -190,7 +190,7 @@ if __name__ == "__main__":
     imbin_file = f"IMG_{cat_name}.bin"
 
     sample = load_catalogue(catalogue, flag_data=True, flag_SNR=False, pandas=True)
-    sample["filename"] = sample.apply(filename, survey="VLASS")
+    sample["filename"] = sample["Component_name"].apply(filename, survey="VLASS")
 
     run_prepro(
         sample,
