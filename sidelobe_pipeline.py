@@ -243,7 +243,7 @@ if __name__ == "__main__":
 
     # If P_sidelobe is stored as an array
     sample["P_sidelobe"] = -np.ones(len(sample))
-    sample.loc[sample.Peak_to_ring <= 3, "P_sidelobe"] = (
+    sample.loc[sample.Peak_to_ring < 3, "P_sidelobe"] = (
         0.01 * Psidelobe[bmu[:, 0], bmu[:, 1]]
     )
 
