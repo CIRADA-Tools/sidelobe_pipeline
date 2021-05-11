@@ -38,6 +38,20 @@ def load_catalogue(catalog, flag_data=True, flag_SNR=False, pandas=False, **kwar
     return rcat
 
 
+def load_fits(filename, ext=0):
+    hdulist = fits.open(filename)
+    d = hdulist[ext]
+    return d
+
+
+def load_radio_fits(filename, ext=0):
+    hdu = load_fits(filename, ext=ext)
+    wcs = WCS(hdu.header).celestial
+    hdu.data = np.squeeze(hdu.data)
+    hdu.header = wcs.to_header()
+    return hdu
+
+
 def scale_data(data, log=False, minsnr=None):
     noise = pu.rms_estimate(data[data != 0], mode="mad", clip_rounds=2)
     # data - np.median(remove_zeros)
@@ -58,7 +72,7 @@ def radio_preprocess(idx, sample, path="images", **kwargs):
     try:
         radio_file = sample["filename"].loc[idx]
         radio_file = os.path.join(path, radio_file)
-        radio_hdu = preprocessing.load_radio_fits(radio_file)
+        radio_hdu = load_radio_fits(radio_file)
         radio_data = radio_hdu.data
         return idx, scale_data(radio_data, **kwargs)
     except:
