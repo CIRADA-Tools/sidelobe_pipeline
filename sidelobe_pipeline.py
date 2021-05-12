@@ -4,6 +4,8 @@ import subprocess
 from multiprocessing import Pool, cpu_count
 import numpy as np
 import pandas as pd
+from astropy.io import fits
+from astropy.wcs import WCS
 from astropy.table import Table
 from astropy import units as u
 import pyink as pu
@@ -239,7 +241,10 @@ if __name__ == "__main__":
     sample = sample.iloc[imgs.records].reset_index(drop=True)
     somset = pu.SOMSet(som, map_file, trans_file)
     sample["bmu"] = somset.mapping.bmu(return_tuples=True)
+    sample["Neuron_dist"] = somset.mapping.bmu_ed()
     bmu = somset.mapping.bmu()
+    sample["Best_neuron_y"] = bmu[:, 0]
+    sample["Best_neuron_x"] = bmu[:, 1]
 
     # This formatting of the neuron table will change in the future
     Psidelobe = np.load(neuron_table_file)
@@ -257,14 +262,22 @@ if __name__ == "__main__":
 
     # If P_sidelobe is stored as an array
     sample["P_sidelobe"] = -np.ones(len(sample))
-    sample.loc[sample.Peak_to_ring < 3, "P_sidelobe"] = (
-        0.01 * Psidelobe[bmu[:, 0], bmu[:, 1]]
-    )
+    lowPtR = sample.Peak_to_ring < 3
+    sample.loc[lowPtR, "P_sidelobe"] = 0.01 * Psidelobe[bmu[:, 0], bmu[:, 1]][lowPtR]
+    trim_sample = sample[
+        [
+            "Component_name",
+            "Best_neuron_y",
+            "Best_neuron_x",
+            "Neuron_dist",
+            "P_sidelobe",
+        ]
+    ]
 
     # Update the Quality_flag column
     original_cat = load_catalogue(
-        catalogue, flag_data=True, flag_SNR=False, pandas=True
+        catalogue, flag_data=False, flag_SNR=False, pandas=True
     )
-    final_cat = pd.merge(original_cat, sample[["Component_name", "P_sidelobe"]])
+    final_cat = pd.merge(original_cat, trim_sample, how="left")
     final_cat.loc[(final_cat.P_sidelobe >= 0.05), "Quality_flag"] += 8
     Table.from_pandas(final_cat).write(args.outfile)
