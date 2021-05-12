@@ -1,6 +1,7 @@
 import os
 import argparse
 import subprocess
+from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import numpy as np
 import pandas as pd
