@@ -9,6 +9,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.table import Table
 from astropy import units as u
+from astropy.coordinates import SkyCoord, search_around_sky
 import pyink as pu
 
 
@@ -19,7 +20,7 @@ def filename(objname, survey="DECaLS-DR8", format="fits"):
     return filename
 
 
-def load_catalogue(catalog, flag_data=True, flag_SNR=False, pandas=False, **kwargs):
+def load_catalogue(catalog, flag_data=False, flag_SNR=False, pandas=False, **kwargs):
     fmt = "fits" if catalog.endswith("fits") else "csv"
     rcat = Table.read(catalog, format=fmt)
 
@@ -56,6 +57,7 @@ def load_radio_fits(filename, ext=0):
 
 
 def scale_data(data, log=False, minsnr=None):
+    img = np.zeros_like(data)
     noise = pu.rms_estimate(data[data != 0], mode="mad", clip_rounds=2)
     # data - np.median(remove_zeros)
 
@@ -63,12 +65,12 @@ def scale_data(data, log=False, minsnr=None):
         mask = data >= minsnr * noise
     else:
         mask = np.ones_like(data, dtype=bool)
+    data = data[mask]
 
     if log:
         data = np.log10(data)
-    prepro = pu.minmax(data, mask=mask)
-    prepro[~mask] = 0
-    return prepro.astype(np.float32)
+    img[mask] = pu.minmax(data)
+    return img.astype(np.float32)
 
 
 def radio_preprocess(idx, sample, path="images", **kwargs):
@@ -78,8 +80,8 @@ def radio_preprocess(idx, sample, path="images", **kwargs):
         radio_hdu = load_radio_fits(radio_file)
         radio_data = radio_hdu.data
         return idx, scale_data(radio_data, **kwargs)
-    except:
-        print(f"Failed on index {idx}")
+    except Exception as e:
+        print(f"Failed on index {idx}: {e}")
         return None
 
 
@@ -94,6 +96,14 @@ def run_prepro(sample, outfile, shape=(150, 150), threads=None, **kwargs):
         ]
         for res in tqdm(results):
             out = res.get()
+            if out is not None:
+                pk_img.add(out[1], attributes=out[0])
+
+
+def run_prepro_seq(sample, outfile, shape=(150, 150), **kwargs):
+    with pu.ImageWriter(outfile, 0, shape, clobber=True) as pk_img:
+        for idx in tqdm(sample.index):
+            out = radio_preprocess(idx, sample, **kwargs)
             if out is not None:
                 pk_img.add(out[1], attributes=out[0])
 
@@ -138,6 +148,45 @@ def map_imbin(
             subprocess.run(commands, stdout=log)
     else:
         subprocess.run(commands)
+
+
+def fill_duplicates(cat, cols):
+    # Fill in `cols` for duplicates by searching for matches in the rest
+    # of the duplicate components.
+    # Need to apply this multiple times because of the duplicate flagging algorithm.
+    missing_comps = cat[(cat.Duplicate_flag >= 1) & np.isnan(cat[cols[0]])]
+    not_missing_comps = cat[(cat.Duplicate_flag >= 1) & ~np.isnan(cat[cols[0]])]
+
+    missing_coords = SkyCoord(
+        missing_comps["RA"].values, missing_comps["DEC"].values, unit=u.deg
+    )
+    not_missing_coords = SkyCoord(
+        not_missing_comps["RA"].values, not_missing_comps["DEC"].values, unit=u.deg
+    )
+
+    idx1, idx2, sep, dist = search_around_sky(
+        missing_coords, not_missing_coords, seplimit=2 * u.arcsec
+    )
+    # When multiple matches are found, choose the one with the highest SNR
+    idx1u, idx1c = np.unique(idx1, return_counts=True)
+    idx2u = [
+        idx2[idx1 == i1][0]
+        if i1c == 1
+        else idx2[idx1 == i1][final_cat.iloc[idx2[idx1 == i1]]["SNR"].argmax()]
+        for i1, i1c in zip(idx1u, idx1c)
+    ]
+
+    for col in cols:
+        cat.loc[missing_comps.iloc[idx1].index, col] = (
+            not_missing_comps[col].iloc[idx2].values
+        )
+
+
+def fill_all_duplicates(cat, cols):
+    nan_count = 0
+    while np.sum(np.isnan(cat[cols[0]])) != nan_count:
+        nan_count = np.sum(np.isnan(cat[cols[0]]))
+        fill_duplicates(cat, cols)
 
 
 def parse_args():
@@ -206,15 +255,19 @@ if __name__ == "__main__":
     cat_name = ".".join(os.path.basename(catalogue).split(".")[:1])
     imbin_file = f"IMG_{cat_name}.bin"
 
-    sample = load_catalogue(catalogue, flag_data=True, flag_SNR=False, pandas=True)
+    sample = load_catalogue(catalogue, flag_data=False, flag_SNR=False, pandas=True)
     sample["filename"] = sample["Component_name"].apply(filename, survey="VLASS")
 
-    run_prepro(
+    # Subset on Duplicate_flag, then fill in those values later
+    # Keep S_Code == "E" (951k)?
+    sample = sample[sample["Duplicate_flag"] < 2].reset_index(drop=True)
+
+    run_prepro_seq(
         sample,
         imbin_file,
         shape=(150, 150),
         path=cutout_path,
-        threads=threads,
+        # threads=threads,
         log=True,
         minsnr=2,
     )
@@ -248,37 +301,35 @@ if __name__ == "__main__":
     sample["Best_neuron_x"] = bmu[:, 1]
 
     # This formatting of the neuron table will change in the future
-    Psidelobe = np.load(neuron_table_file)
+    neuron_table = pd.read_csv(neuron_table_file)
+    Psidelobe = -np.ones((neuron_table.bmu_y.max() + 1, neuron_table.bmu_x.max() + 1))
+    Psidelobe[neuron_table.bmu_y, neuron_table.bmu_x] = neuron_table.P_sidelobe
 
-    """
-    # If P_sidelobe is stored as a table, convert it to an array
-    bmu_y, bmu_x = np.where(Psidelobe >= 0)
-    Ps_df = pd.DataFrame(
-        {"bmu_y": bmu_y, "bmu_x": bmu_x, "P_sidelobe": Psidelobe.flatten()}
-    )
-    neuron
-    Psidelobe = -np.ones((Ps_df.bmu_y.max()+1, Ps_df.bmu_x.max()+1))
-    Psidelobe[Ps_df.bmu_y, Ps_df.bmu_x] = Ps_df.P_sidelobe
-    """
-
-    # If P_sidelobe is stored as an array
     sample["P_sidelobe"] = -np.ones(len(sample))
-    lowPtR = sample.Peak_to_ring < 3
+    lowPtR = (sample.Peak_to_ring < 3) & (sample.S_Code != "E")
     sample.loc[lowPtR, "P_sidelobe"] = 0.01 * Psidelobe[bmu[:, 0], bmu[:, 1]][lowPtR]
-    trim_sample = sample[
-        [
-            "Component_name",
-            "Best_neuron_y",
-            "Best_neuron_x",
-            "Neuron_dist",
-            "P_sidelobe",
-        ]
+
+    neuron_cols = [
+        "Best_neuron_y",
+        "Best_neuron_x",
+        "Neuron_dist",
+        "P_sidelobe",
     ]
+    sample = sample[["Component_name"] + neuron_cols]
 
     # Update the Quality_flag column
     original_cat = load_catalogue(
         catalogue, flag_data=False, flag_SNR=False, pandas=True
     )
-    final_cat = pd.merge(original_cat, trim_sample, how="left")
-    final_cat.loc[(final_cat.P_sidelobe >= 0.05), "Quality_flag"] += 8
+    final_cat = pd.merge(original_cat, sample, how="left")
+
+    # Add the info for duplicates
+    fill_all_duplicates(final_cat, cols=neuron_cols)
+
+    final_cat.loc[(final_cat.P_sidelobe >= 0.1), "Quality_flag"] += 8
+
+    for key in ["SNR", "filename"]:
+        if key in final_cat:
+            del final_cat[key]
+
     Table.from_pandas(final_cat).write(args.outfile)
