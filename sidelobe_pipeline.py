@@ -1,4 +1,4 @@
-import os
+import os, sys
 import argparse
 import subprocess
 from tqdm import tqdm
@@ -10,6 +10,7 @@ from astropy.wcs import WCS
 from astropy.table import Table
 from astropy import units as u
 from astropy.coordinates import SkyCoord, search_around_sky
+from reproject import reproject_interp
 import pyink as pu
 
 
@@ -56,6 +57,24 @@ def load_radio_fits(filename, ext=0):
     return hdu
 
 
+def recenter_regrid(hdu, ra, dec, img_size, pix_size=0.6, reproj_hdr=None):
+    # Recentering the reference pixel
+    if reproj_hdr is None:
+        reproj_hdr = hdu.header.copy()
+    reproj_hdr["CRVAL1"] = ra
+    reproj_hdr["CRVAL2"] = dec
+    reproj_hdr["CRPIX1"] = img_size[0] // 2 + 0.5
+    reproj_hdr["CRPIX2"] = img_size[1] // 2 + 0.5
+    reproj_hdr["CDELT1"] = np.sign(reproj_hdr["CDELT1"]) * pix_size / 3600
+    reproj_hdr["CDELT2"] = np.sign(reproj_hdr["CDELT2"]) * pix_size / 3600
+    reproj_wcs = WCS(reproj_hdr).celestial
+
+    reproj_data, reproj_footprint = reproject_interp(
+        hdu, reproj_wcs, shape_out=img_size
+    )
+    return reproj_data
+
+
 def scale_data(data, log=False, minsnr=None):
     img = np.zeros_like(data)
     noise = pu.rms_estimate(data[data != 0], mode="mad", clip_rounds=2)
@@ -73,12 +92,23 @@ def scale_data(data, log=False, minsnr=None):
     return img.astype(np.float32)
 
 
-def radio_preprocess(idx, sample, path="images", **kwargs):
+def radio_preprocess(idx, sample, path="images", img_size=(150, 150), **kwargs):
     try:
-        radio_file = sample["filename"].loc[idx]
+        radio_comp = sample.iloc[idx]
+        radio_file = radio_comp["filename"]
         radio_file = os.path.join(path, radio_file)
         radio_hdu = load_radio_fits(radio_file)
         radio_data = radio_hdu.data
+
+        if radio_data.shape != img_size:
+            radio_data = recenter_regrid(
+                radio_hdu,
+                radio_comp["RA"],
+                radio_comp["DEC"],
+                img_size=img_size,
+                pix_size=0.6,
+            )
+
         return idx, scale_data(radio_data, **kwargs)
     except Exception as e:
         print(f"Failed on index {idx}: {e}")
@@ -103,7 +133,7 @@ def run_prepro(sample, outfile, shape=(150, 150), threads=None, **kwargs):
 def run_prepro_seq(sample, outfile, shape=(150, 150), **kwargs):
     with pu.ImageWriter(outfile, 0, shape, clobber=True) as pk_img:
         for idx in tqdm(sample.index):
-            out = radio_preprocess(idx, sample, **kwargs)
+            out = radio_preprocess(idx, sample, img_size=shape, **kwargs)
             if out is not None:
                 pk_img.add(out[1], attributes=out[0])
 
@@ -300,7 +330,7 @@ if __name__ == "__main__":
     sample["Best_neuron_y"] = bmu[:, 0]
     sample["Best_neuron_x"] = bmu[:, 1]
 
-    # This formatting of the neuron table will change in the future
+    # Neuron table is one row per neuron. Reshape P_sidelobe into an array.
     neuron_table = pd.read_csv(neuron_table_file)
     Psidelobe = -np.ones((neuron_table.bmu_y.max() + 1, neuron_table.bmu_x.max() + 1))
     Psidelobe[neuron_table.bmu_y, neuron_table.bmu_x] = neuron_table.P_sidelobe
@@ -325,6 +355,10 @@ if __name__ == "__main__":
 
     # Add the info for duplicates
     fill_all_duplicates(final_cat, cols=neuron_cols)
+    # Fill NaN from components that did not have cutouts
+    final_cat = final_cat.fillna(
+        value=dict(Best_neuron_y=-1, Best_neuron_x=-1, Neuron_dist=-1, P_sidelobe=-1)
+    )
 
     final_cat.loc[(final_cat.P_sidelobe >= 0.1), "Quality_flag"] += 8
 
