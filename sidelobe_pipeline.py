@@ -322,7 +322,16 @@ if __name__ == "__main__":
 
     # Update the component catalogue with the sidelobe probability
     imgs = pu.ImageReader(imbin_file)
+
+    failed = sample.iloc[list(set(sample.index).difference(imgs.records))].reset_index(
+        drop=True
+    )
+    Table.from_pandas(failed).write(f"{cat_name}_failed.fits")
+
     sample = sample.iloc[imgs.records].reset_index(drop=True)
+    Table.from_pandas(sample).write(f"{cat_name}_preprocessed.fits")
+    del imgs
+
     somset = pu.SOMSet(som, map_file, trans_file)
     sample["bmu"] = somset.mapping.bmu(return_tuples=True)
     sample["Neuron_dist"] = somset.mapping.bmu_ed()
@@ -352,6 +361,7 @@ if __name__ == "__main__":
         catalogue, flag_data=False, flag_SNR=False, pandas=True
     )
     final_cat = pd.merge(original_cat, sample, how="left")
+    del original_cat
 
     # Add the info for duplicates
     fill_all_duplicates(final_cat, cols=neuron_cols)
