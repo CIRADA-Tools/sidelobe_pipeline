@@ -265,22 +265,25 @@ def parse_args():
         default=False,
         type=bool,
     )
+    parser.add_argument(
+        "--overwrite",
+        dest="clobber",
+        help="Overwrite the Image and Map binaries",
+        default=False,
+        type=bool,
+    )
     args = parser.parse_args()
     return args
 
 
 if __name__ == "__main__":
-    # cutout_path = "/home/adrian/CIRADA/Sample/Sidelobes/images_150pix"
-    # catalogue = "/home/adrian/CIRADA/Data/vlass/CIRADA_VLASS1QL_table1_components_v1.fits"
-    # som_file = "/home/adrian/CIRADA/SOM/Sidelobes/PtR3_log_SN2/SOM_B3_h10_w10_vlass.bin"
-    # neuron_table_file = "/home/adrian/CIRADA/SOM/Sidelobes/PtR3_log_SN2/Psidelobe.npy"
-
     args = parse_args()
     catalogue = args.catalogue
     cutout_path = args.cutout_path
     som_file = args.som_file
     neuron_table_file = args.neuron_table_file
     threads = args.threads
+    clobber = args.clobber
 
     cat_name = ".".join(os.path.basename(catalogue).split(".")[:1])
     imbin_file = f"IMG_{cat_name}.bin"
@@ -289,36 +292,47 @@ if __name__ == "__main__":
     sample["filename"] = sample["Component_name"].apply(filename, survey="VLASS")
 
     # Subset on Duplicate_flag, then fill in those values later
-    # Keep S_Code == "E" (951k)?
     sample = sample[sample["Duplicate_flag"] < 2].reset_index(drop=True)
 
-    run_prepro_seq(
-        sample,
-        imbin_file,
-        shape=(150, 150),
-        path=cutout_path,
-        # threads=threads,
-        log=True,
-        minsnr=2,
-    )
+    if not os.path.exists(imbin_file) or clobber:
+        run_prepro_seq(
+            sample,
+            imbin_file,
+            shape=(150, 150),
+            path=cutout_path,
+            # threads=threads,
+            log=True,
+            minsnr=2,
+        )
+    else:
+        print(f"Image binary {imbin_file} already exists...skipping.")
+
+    # EXIT HERE if mapping is being conducted on a different machine
+    # sys.exit(1)
 
     # Map the image binary through the SOM
     som = pu.SOM(som_file)
     som_width, som_height, ndim = som.som_shape
     map_file = imbin_file.replace("IMG", "MAP")
     trans_file = map_file.replace("MAP", "TRANSFORM")
-    map_imbin(
-        imbin_file,
-        som_file,
-        map_file,
-        trans_file,
-        som_width,
-        som_height,
-        numthreads=cpu_count(),
-        cpu=args.cpu,
-        nrot=360,
-        log=True,
-    )
+
+    if not os.path.exists(map_file) or not os.path.exists(trans_file) or clobber:
+        map_imbin(
+            imbin_file,
+            som_file,
+            map_file,
+            trans_file,
+            som_width,
+            som_height,
+            numthreads=cpu_count(),
+            cpu=args.cpu,
+            nrot=360,
+            log=True,
+        )
+    else:
+        print(
+            f"Mapping binary {map_file} and Transform file {trans_file} already exist...skipping."
+        )
 
     # Update the component catalogue with the sidelobe probability
     imgs = pu.ImageReader(imbin_file)
@@ -326,10 +340,10 @@ if __name__ == "__main__":
     failed = sample.iloc[list(set(sample.index).difference(imgs.records))].reset_index(
         drop=True
     )
-    Table.from_pandas(failed).write(f"{cat_name}_failed.fits")
+    Table.from_pandas(failed).write(f"{cat_name}_failed.fits", overwrite=True)
 
     sample = sample.iloc[imgs.records].reset_index(drop=True)
-    Table.from_pandas(sample).write(f"{cat_name}_preprocessed.fits")
+    Table.from_pandas(sample).write(f"{cat_name}_preprocessed.fits", overwrite=True)
     del imgs
 
     somset = pu.SOMSet(som, map_file, trans_file)
@@ -376,4 +390,4 @@ if __name__ == "__main__":
         if key in final_cat:
             del final_cat[key]
 
-    Table.from_pandas(final_cat).write(args.outfile)
+    Table.from_pandas(final_cat).write(args.outfile, overwrite=True)
