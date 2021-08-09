@@ -1,3 +1,26 @@
+"""The main pipeline to identify sidelobes in VLASS using a SOM.
+
+Requirements:
+- The VLASS Component catalogue
+- ALL image cutouts (VLASS only) for the specified sample
+
+Provided in this repo:
+- SOM_B3_h10_w10_vlass.bin: The trained SOM binary file.
+- neuron_info.csv: Contains the sidelobe probabilities for each neuron.
+
+The process is conducted as follows:
+1. Preprocess the data
+   - Creates an Image binary
+2. Map the Image binary onto the SOM
+   - Creates the MAP and TRANSFORM binaries
+3. Update the Component catalogue using the results from the Mapping.
+   - Outputs the final Component catalogue plus two other catalogues
+     that are useful for debugging.
+
+**Note: Step (2) *must* be run on a GPU, unless you are fine with
+waiting over a month (probably) for it to complete!
+"""
+
 import os, sys
 import argparse
 import subprocess
@@ -15,13 +38,19 @@ import pyink as pu
 
 
 def filename(objname, survey="DECaLS-DR8", format="fits"):
+    """Convert a Component_name into a filename. Another method can
+    be used as long as it is consistently applied."""
     # Take Julian coords of name to eliminate white space - eliminate prefix
     name = objname.split(" ")[1]
-    filename = f"{name}_{survey}.{format}"
-    return filename
+    fname = f"{name}_{survey}.{format}"
+    return fname
 
 
 def load_catalogue(catalog, flag_data=False, flag_SNR=False, pandas=False, **kwargs):
+    """Load the Component catalogue in as either an astropy.Table (default)
+    or a pandas.DataFrame (if pandas=True).
+    Optionally apply common flags.
+    """
     fmt = "fits" if catalog.endswith("fits") else "csv"
     rcat = Table.read(catalog, format=fmt)
 
@@ -50,6 +79,7 @@ def load_fits(filename, ext=0):
 
 
 def load_radio_fits(filename, ext=0):
+    """Load the data from a single extension of a fits file."""
     hdu = load_fits(filename, ext=ext)
     wcs = WCS(hdu.header).celestial
     hdu.data = np.squeeze(hdu.data)
@@ -58,6 +88,10 @@ def load_radio_fits(filename, ext=0):
 
 
 def recenter_regrid(hdu, ra, dec, img_size, pix_size=0.6, reproj_hdr=None):
+    """Update the header info for an image such that it is defined relative
+    to its central pixel. Additionally, reproject the image and regrid the
+    pixels onto a new scale so that all images have the same pixel size.
+    """
     # Recentering the reference pixel
     if reproj_hdr is None:
         reproj_hdr = hdu.header.copy()
@@ -76,6 +110,7 @@ def recenter_regrid(hdu, ra, dec, img_size, pix_size=0.6, reproj_hdr=None):
 
 
 def scale_data(data, log=False, minsnr=None):
+    """Scale the data so that the SOM behaves appropriately."""
     img = np.zeros_like(data)
     noise = pu.rms_estimate(data[data != 0], mode="mad", clip_rounds=2)
     # data - np.median(remove_zeros)
@@ -93,6 +128,8 @@ def scale_data(data, log=False, minsnr=None):
 
 
 def radio_preprocess(idx, sample, path="images", img_size=(150, 150), **kwargs):
+    """Preprocess a VLASS image.
+    """
     try:
         radio_comp = sample.iloc[idx]
         radio_file = radio_comp["filename"]
@@ -116,6 +153,10 @@ def radio_preprocess(idx, sample, path="images", img_size=(150, 150), **kwargs):
 
 
 def run_prepro(sample, outfile, shape=(150, 150), threads=None, **kwargs):
+    """Preprocess all VLASS images, creating an image binary.
+    Note that the parallization is not working properly, and actually 
+    results in a slow-down if the sample size is too large.
+    """
     with pu.ImageWriter(outfile, 0, shape, clobber=True) as pk_img:
         if threads is None:
             threads = cpu_count()
@@ -131,6 +172,8 @@ def run_prepro(sample, outfile, shape=(150, 150), threads=None, **kwargs):
 
 
 def run_prepro_seq(sample, outfile, shape=(150, 150), **kwargs):
+    """Sequential preprocessing for all VLASS images.
+    """
     with pu.ImageWriter(outfile, 0, shape, clobber=True) as pk_img:
         for idx in tqdm(sample.index):
             out = radio_preprocess(idx, sample, img_size=shape, **kwargs)
@@ -150,6 +193,8 @@ def map_imbin(
     nrot=360,
     log=True,
 ):
+    """Map an image binary onto a SOM using Pink.
+    """
     commands = [
         "Pink",
         "--map",
@@ -181,6 +226,10 @@ def map_imbin(
 
 
 def fill_duplicates(cat, cols):
+    """Since duplicates are excluded in the catalogue (to save time), 
+    they must be filled in to create a complete catalogue.
+    Due to nuances in the flagging routine, this must be done iteratively.
+    """
     # Fill in `cols` for duplicates by searching for matches in the rest
     # of the duplicate components.
     # Need to apply this multiple times because of the duplicate flagging algorithm.
@@ -285,7 +334,7 @@ if __name__ == "__main__":
     threads = args.threads
     clobber = args.clobber
 
-    cat_name = ".".join(os.path.basename(catalogue).split(".")[:1])
+    cat_name = ".".join(os.path.basename(catalogue).split(".")[:-1])
     imbin_file = f"IMG_{cat_name}.bin"
 
     sample = load_catalogue(catalogue, flag_data=False, flag_SNR=False, pandas=True)
@@ -334,18 +383,26 @@ if __name__ == "__main__":
             f"Mapping binary {map_file} and Transform file {trans_file} already exist...skipping."
         )
 
+    # CONTINUE HERE if Mapping was done on a different machine.
+
     # Update the component catalogue with the sidelobe probability
     imgs = pu.ImageReader(imbin_file)
 
+    # Output a table of components that failed to preprocess
+    # This is usually due to missing files
     failed = sample.iloc[list(set(sample.index).difference(imgs.records))].reset_index(
         drop=True
     )
     Table.from_pandas(failed).write(f"{cat_name}_failed.fits", overwrite=True)
 
+    # Output a table of all preprocessed components.
+    # This matches the length of the IMG and MAP binaries, which makes
+    # it useful for inspecting the results.
     sample = sample.iloc[imgs.records].reset_index(drop=True)
     Table.from_pandas(sample).write(f"{cat_name}_preprocessed.fits", overwrite=True)
     del imgs
 
+    # Determine the best-matching neurons and their Euclidean distances
     somset = pu.SOMSet(som, map_file, trans_file)
     sample["bmu"] = somset.mapping.bmu(return_tuples=True)
     sample["Neuron_dist"] = somset.mapping.bmu_ed()
@@ -358,6 +415,9 @@ if __name__ == "__main__":
     Psidelobe = -np.ones((neuron_table.bmu_y.max() + 1, neuron_table.bmu_x.max() + 1))
     Psidelobe[neuron_table.bmu_y, neuron_table.bmu_x] = neuron_table.P_sidelobe
 
+    # Assign the sidelobe probability to all components with
+    # LOW Peak_to_ring that are NOT empty islands
+    # High Peak_to_ring keeps a P_sidelobe of -1
     sample["P_sidelobe"] = -np.ones(len(sample))
     lowPtR = (sample.Peak_to_ring < 3) & (sample.S_Code != "E")
     sample.loc[lowPtR, "P_sidelobe"] = 0.01 * Psidelobe[bmu[:, 0], bmu[:, 1]][lowPtR]
@@ -377,13 +437,17 @@ if __name__ == "__main__":
     final_cat = pd.merge(original_cat, sample, how="left")
     del original_cat
 
-    # Add the info for duplicates
+    # Duplicates were initially removed. Fill in their info.
     fill_all_duplicates(final_cat, cols=neuron_cols)
+
     # Fill NaN from components that did not have cutouts
+    # Null values are all -1.
     final_cat = final_cat.fillna(
         value=dict(Best_neuron_y=-1, Best_neuron_x=-1, Neuron_dist=-1, P_sidelobe=-1)
     )
 
+    # Increment the Quality_flag column by 8 for any components that
+    # should be flagged as a sidelobe (i.e. >= 10% probability)
     final_cat.loc[(final_cat.P_sidelobe >= 0.1), "Quality_flag"] += 8
 
     for key in ["SNR", "filename"]:
